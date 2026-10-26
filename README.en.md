@@ -4,7 +4,7 @@
 
 **Reusable Agent assets drawn from personal development practice.**
 
-For developers using Agents: Prompts, Skills, MCP tools, Hooks and working patterns. Personal project names, machine paths and private settings are removed; purpose, prerequisites and validation stay with each asset.
+For developers using Agents: Prompts, Skills, MCP tools, Hooks and working patterns.
 
 [Browse assets](#asset-index) · [Usage](#usage) · [简体中文](README.md) · [English](README.en.md)
 

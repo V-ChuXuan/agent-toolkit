@@ -4,7 +4,7 @@
 
 **把个人开发实践提炼成可按需采用的 Agent 资产。**
 
-面向使用 Agent 的开发者，收录 Prompts、Skills、MCP 工具、Hooks 和工作方法。去掉个人项目名、本机路径与私有配置，保留用途、前提和验证方式。
+面向使用 Agent 的开发者，收录 Prompts、Skills、MCP 工具、Hooks 和工作方法。
 
 [浏览资产](#资产索引) · [使用说明](#用法) · [简体中文](README.md) · [English](README.en.md)
 
