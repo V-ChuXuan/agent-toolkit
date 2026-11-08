@@ -102,6 +102,10 @@ class SessionTitleCoreTests(unittest.TestCase):
                 MODULE._profile_context(profile, root / "PROJECTS" / "DEMO-PROJECT").object_hint,
                 "示例项目",
             )
+            long_dir = root / "projects" / ("very-long-project-name-" * 2)
+            compacted = MODULE._profile_context(profile, long_dir).object_hint
+            self.assertLessEqual(len(compacted), MODULE.TARGET_TITLE_CHARS)
+            self.assertTrue(compacted.endswith("…"))
             self.assertIsNone(MODULE._profile_context(profile, root / ".tmp" / "probe"))
 
     def test_nearest_profile_and_environment_override(self):
@@ -203,10 +207,13 @@ class SessionTitleCoreTests(unittest.TestCase):
             self.assertEqual(first["context"]["kind_hint"], "项目")
             self.assertEqual(first["context"]["object_hint"], "示例项目")
             self.assertEqual(first["context"]["language"], "zh-CN")
-            self.assertEqual(first["context"]["format"], "模块名 | 持续目标")
+            self.assertEqual(first["context"]["format"], "类型 | 对象 | 持续目标")
             for expected in (
                 "先完成用户首个实质任务，在发送最终答复前才调用宿主原生标题工具改名一次",
+                "首选三级格式“类型 | 对象 | 持续目标”",
+                "缺少稳定类型或对象时降为两级",
                 "优先写具体对象、行为、错误现象或决策",
+                "最多 40 个字符",
                 "后续追问不再改名",
                 "不要向用户展示标题建议或解释改名要求",
                 "无原生工具时正常完成，不伪造改名",
@@ -224,7 +231,17 @@ class SessionTitleCoreTests(unittest.TestCase):
             persisted = json.loads(files[0].read_text(encoding="utf-8"))
             self.assertEqual(
                 set(persisted),
-                {"version", "host", "profile", "phase", "claimed_at"},
+                {
+                    "version",
+                    "host",
+                    "profile",
+                    "phase",
+                    "request_kind",
+                    "attempts",
+                    "title_updates",
+                    "requested_at",
+                    "claimed_at",
+                },
             )
             self.assertNotIn(prompt, files[0].read_text(encoding="utf-8"))
             self.assertNotIn(str(cwd), files[0].read_text(encoding="utf-8"))
@@ -270,6 +287,108 @@ class SessionTitleCoreTests(unittest.TestCase):
                 )
             self.assertEqual(result["action"], "request_title")
             self.assertEqual(len(list(state.rglob("*.json"))), 1)
+
+    def test_requested_title_retries_after_cooldown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_profile(root)
+            cwd = root / "projects" / "demo-project"
+            cwd.mkdir(parents=True)
+            state = root / "state"
+            data = payload(cwd, "实现会话标题 Hook", session_id="retry")
+            with patch.dict(os.environ, {"SESSION_TITLE_STATE_ROOT": str(state)}):
+                first = MODULE.prepare(data, now=100)
+                waiting = MODULE.prepare(data, now=120)
+                retry = MODULE.prepare(data, now=161)
+            self.assertEqual(first["action"], "request_title")
+            self.assertEqual(waiting["reason"], "already_requested")
+            self.assertEqual(retry["reason"], "retry")
+            persisted = json.loads(next(state.rglob("*.json")).read_text(encoding="utf-8"))
+            self.assertEqual(persisted["attempts"], 2)
+
+    def test_generated_title_can_review_explicit_topic_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_profile(root)
+            cwd = root / "projects" / "demo-project"
+            cwd.mkdir(parents=True)
+            state = root / "state"
+            data = payload(cwd, "实现会话标题 Hook", session_id="review")
+            first_title = "项目 | 示例项目 | 收紧会话标题"
+            with patch.dict(os.environ, {"SESSION_TITLE_STATE_ROOT": str(state)}):
+                first = MODULE.prepare(data, now=100)
+                applied = MODULE.prepare(
+                    {**data, "current_title": first_title},
+                    now=101,
+                )
+                stable = MODULE.prepare(
+                    {**data, "current_title": first_title},
+                    now=102,
+                )
+                review = MODULE.prepare(
+                    {
+                        **data,
+                        "prompt": "转到 C 盘空间分析，更新一下标题",
+                        "current_title": first_title,
+                    },
+                    now=200,
+                )
+                renamed = MODULE.prepare(
+                    {
+                        **data,
+                        "prompt": "继续看 C 盘空间分析",
+                        "current_title": "分析 | C 盘 | 空间占用与清理",
+                    },
+                    now=261,
+                )
+                unchanged = MODULE.prepare(
+                    {
+                        **data,
+                        "prompt": "继续看 C 盘空间分析",
+                        "current_title": "分析 | C 盘 | 空间占用与清理",
+                    },
+                    now=262,
+                )
+            self.assertEqual(first["action"], "request_title")
+            self.assertEqual(applied["reason"], "title_applied")
+            self.assertEqual(stable["reason"], "stable_title")
+            self.assertEqual(review["reason"], "topic_change")
+            self.assertEqual(review["context"]["mode"], "review")
+            self.assertEqual(renamed["reason"], "title_applied")
+            self.assertEqual(unchanged["reason"], "stable_title")
+
+    def test_changed_title_locks_future_automatic_updates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_profile(root)
+            cwd = root / "projects" / "demo-project"
+            cwd.mkdir(parents=True)
+            state = root / "state"
+            data = payload(cwd, "实现会话标题 Hook", session_id="manual-after-auto")
+            with patch.dict(os.environ, {"SESSION_TITLE_STATE_ROOT": str(state)}):
+                MODULE.prepare(data, now=100)
+                MODULE.prepare(
+                    {**data, "current_title": "项目 | 示例项目 | 收紧会话标题"},
+                    now=101,
+                )
+                manual = MODULE.prepare(
+                    {
+                        **data,
+                        "prompt": "转到 C 盘空间分析",
+                        "current_title": "我自己命名的会话",
+                    },
+                    now=200,
+                )
+                followup = MODULE.prepare(
+                    {
+                        **data,
+                        "prompt": "转到 DeepSeek 日志",
+                        "current_title": "我自己命名的会话",
+                    },
+                    now=261,
+                )
+            self.assertEqual(manual["reason"], "manual_title")
+            self.assertEqual(followup["reason"], "manual_title")
 
     def test_concurrent_processes_claim_once(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -324,23 +443,28 @@ class SessionTitleCoreTests(unittest.TestCase):
         self.assertEqual(valid["reason"], "ok")
         self.assertNotIn("warning", valid)
 
-        recommended = MODULE.validate_title("会话标题 Hook | 收紧标题状态与指令")
+        recommended = MODULE.validate_title("项目 | 群脉 | 修复重复扫描")
         self.assertTrue(recommended["valid"])
         self.assertEqual(recommended["reason"], "ok")
         self.assertNotIn("warning", recommended)
 
-        long_name = "LongRepositoryNameWithImportantSuffix"
-        soft = MODULE.validate_title(f"实现·{long_name} | 通用会话标题 Hook")
+        legacy = MODULE.validate_title("意图·对象 | 任务")
+        self.assertTrue(legacy["valid"])
+        self.assertNotIn("warning", legacy)
+
+        soft = MODULE.validate_title("项目 | LongRepositoryName | 通用会话标题 Hook")
         self.assertTrue(soft["valid"])
         self.assertEqual(soft["warning"], "soft_max_exceeded")
 
         invalid = {
             "": "empty",
             "实现·对象": "separator",
-            "a | b | c": "separator",
+            "a | b | c | d": "separator",
             "a|b": "separator",
             "·对象 | 任务": "left_parts",
             "意图· | 任务": "left_parts",
+            "项目 |  | 任务": "empty_part",
+            "项目·群脉 | 对象 | 任务": "left_parts",
             "意图·对象 | <tag>": "control_or_tag",
             "意图·对象 | api_key=secret-value": "sensitive_input",
             "意图·对象 | https://example.com": "contains_url",

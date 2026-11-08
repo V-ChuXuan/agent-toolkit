@@ -128,6 +128,8 @@ class CodexHostTests(unittest.TestCase):
             context = output["hookSpecificOutput"]["additionalContext"]
             self.assertIn("<session-title-task>", context)
             self.assertIn("Scope object: demo", context)
+            self.assertIn("Format: 类型 | 对象 | 持续目标", context)
+            self.assertIn("Hard max chars: 40", context)
             self.assertIn("发送最终答复前", context)
             self.assertEqual(len(list(state.rglob("*.json"))), 1)
 

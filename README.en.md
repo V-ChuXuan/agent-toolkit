@@ -20,6 +20,7 @@ Choose an asset by the problem you want to solve, then read its guide. Keep a Sk
 | --- | --- | --- | --- | --- |
 | [README Writer](skills/readme-writer/README.md) | Write, update, trim, audit and format READMEs using project evidence | An explicit request to handle a README or similar Markdown project document | `experimental` | `0.1.0` |
 | [Session Title](hooks/session-title/README.md) | Prepare a single session-naming request for a host | A host supports Hooks or extensions and can confirm its current title state | `experimental` | `0.1.0` |
+| [Project Agents](instructions/README.md) | Provide a starting template for a project's `AGENTS.md` | Starting a project or unifying project-level agent rules | `experimental` | `0.1.0` |
 
 `experimental` means runnable content exists, but you still need to validate it against your host and tasks. Passing Python checks does not guarantee model output quality or automatic host renaming.
 
@@ -38,6 +39,7 @@ For session naming, start with [Session Title's host integration](hooks/session-
 | [prompts/](prompts/README.md) | Standalone task prompts and input/output contracts | No assets yet |
 | [mcp/](mcp/README.md) | MCP tools, services or shareable integration guides | No assets yet |
 | [patterns/](patterns/README.md) | Reusable working methods, decision steps and validation | No assets yet |
+| [instructions/](instructions/README.md) | Project-level agent instruction templates, including `AGENTS.md` and its Chinese edition | Project Agents |
 | [experiments/](experiments/README.md) | Trials and observations not yet developed into formal assets | No assets yet |
 
 Use the index's problem and context columns to find an asset, then read its README. A Skill's detailed behavior lives in `SKILL.md`; a Hook's host requirements live in its integration guide.

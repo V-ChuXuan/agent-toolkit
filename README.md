@@ -20,6 +20,7 @@
 | --- | --- | --- | --- | --- |
 | [README Writer](skills/readme-writer/README.md) | 按项目证据写作、更新、精简、审查和格式化 README | 明确要求处理 README 或类似 Markdown 项目文档 | `experimental` | `0.1.0` |
 | [Session Title](hooks/session-title/README.md) | 为宿主准备一次会话命名请求 | 宿主支持 Hook 或扩展，并能确认当前标题状态 | `experimental` | `0.1.0` |
+| [Project Agents](instructions/README.md) | 提供项目 `AGENTS.md` 的起点模板 | 新建项目或统一项目级 Agent 约定 | `experimental` | `0.1.0` |
 
 `experimental` 表示已有可运行内容，仍需在自己的宿主和任务上验证。Python 检查通过不代表模型输出质量或宿主自动改名已得到保证。
 
@@ -38,6 +39,7 @@
 | [prompts/](prompts/README.md) | 可独立使用的任务提示词与输入输出约定 | 暂无资产 |
 | [mcp/](mcp/README.md) | MCP 工具、服务或可分享的接入说明 | 暂无资产 |
 | [patterns/](patterns/README.md) | 可复用的工作方法、判断步骤和验证方式 | 暂无资产 |
+| [instructions/](instructions/README.md) | 项目级 Agent 指令模板，如 `AGENTS.md` 及其中文版 | Project Agents |
 | [experiments/](experiments/README.md) | 尚未形成正式资产的实验与观察 | 暂无资产 |
 
 先看索引中的问题和场景，再读目标资产的 README。Skill 的详细行为在它的 `SKILL.md` 中；Hook 的宿主要求在其接入说明中。

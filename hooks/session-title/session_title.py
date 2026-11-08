@@ -16,10 +16,13 @@ from typing import Any
 
 MAX_INPUT_BYTES = 64 * 1024
 MAX_FIELD_CHARS = 8 * 1024
-MAX_TITLE_CHARS = 80
+MAX_TITLE_CHARS = 40
 TARGET_TITLE_CHARS = 24
-SOFT_MAX_TITLE_CHARS = 24
+SOFT_MAX_TITLE_CHARS = 32
 STATE_TTL_SECONDS = 30 * 24 * 60 * 60
+RETRY_COOLDOWN_SECONDS = 60
+MAX_REQUEST_ATTEMPTS = 3
+MAX_TITLE_UPDATES = 2
 PROFILE_FILE = ".session-title.json"
 URL_ONLY = re.compile(r"(?:(?:https?://|www\.)[^\s<>]+)", re.IGNORECASE)
 SECRET = re.compile(
@@ -62,6 +65,11 @@ AMBIGUOUS_FOLLOWUP = re.compile(
     r"|(?:现在|目前)(?:呢|怎么样)"
     r"|还有什么优化空间(?:吗)?"
     r")[\s!！。．,.，？?~～]*$",
+    re.IGNORECASE,
+)
+TITLE_UPDATE_REQUEST = re.compile(
+    r"(?:重命名|重新命名|更新标题|修改标题|改一下标题|标题改成|换个标题|换一个标题|"
+    r"换个话题|转到|转为|改为|接下来(?:看|处理|做)|另外(?:看|处理|一个))",
     re.IGNORECASE,
 )
 CONTROL_OR_TAG = re.compile(r"[\x00-\x1f\x7f<>]")
@@ -183,6 +191,12 @@ def _display_alias(value: str, aliases: dict[str, str]) -> str:
         if key.casefold() == value.casefold():
             return alias
     return value
+
+
+def _compact_object(value: str) -> str:
+    if len(value) <= TARGET_TITLE_CHARS:
+        return value
+    return value[: TARGET_TITLE_CHARS - 1].rstrip() + "…"
 
 
 def _parse_profile_file(path: Path) -> Profile:
@@ -342,6 +356,7 @@ def _profile_context(profile: Profile, cwd: Path) -> PathContext | None:
             if len(selected) < depth:
                 return None
             object_name = "/".join(_display_alias(part, profile.aliases) for part in selected)
+        object_name = _compact_object(object_name)
         return PathContext(
             relative_path="/".join(relative),
             kind_hint=rule["kind"],
@@ -360,7 +375,7 @@ def _profile_context(profile: Profile, cwd: Path) -> PathContext | None:
         return PathContext(
             relative_path="/".join(relative),
             kind_hint="项目",
-            object_hint=_display_alias(git_root.name, profile.aliases) or "项目",
+            object_hint=_compact_object(_display_alias(git_root.name, profile.aliases)) or "项目",
         )
 
     temporary = _safe_path(tempfile.gettempdir())
@@ -375,7 +390,7 @@ def _profile_context(profile: Profile, cwd: Path) -> PathContext | None:
         return PathContext(
             relative_path="/".join(relative),
             kind_hint="工作区",
-            object_hint=_display_alias(root_name, profile.aliases) or "工作区",
+            object_hint=_compact_object(_display_alias(root_name, profile.aliases)) or "工作区",
         )
     return PathContext(relative_path="/".join(relative), kind_hint="工作区", object_hint="工作区")
 
@@ -412,6 +427,17 @@ def _gate_reason(prompt: Any) -> str | None:
     return None
 
 
+def title_update_requested(prompt: Any) -> bool:
+    text = _request_text(prompt)
+    return bool(text and TITLE_UPDATE_REQUEST.search(text))
+
+
+def needs_probe(status: str, prompt: Any) -> bool:
+    if status in {"absent", "requested", "review_requested"}:
+        return True
+    return status == "applied" and title_update_requested(prompt)
+
+
 def _effective_language(profile: Profile, prompt: str) -> str:
     if profile.language != "auto":
         return profile.language
@@ -446,7 +472,7 @@ def request_status(
     session_id: str,
     now: float | None = None,
 ) -> str:
-    """Return requested, absent, or unknown without creating state."""
+    """Return the persisted title lifecycle phase without creating state."""
     if (
         not isinstance(host, str)
         or not re.fullmatch(r"[a-z0-9_-]+", host)
@@ -467,7 +493,9 @@ def request_status(
         if current - path.stat().st_mtime > STATE_TTL_SECONDS:
             path.unlink()
             return "absent"
-        return "requested"
+        state = _read_state(path)
+        phase = state.get("phase") if isinstance(state, dict) else None
+        return phase if phase in {"requested", "review_requested", "applied", "manual"} else "requested"
     except OSError:
         return "unknown"
 
@@ -499,10 +527,14 @@ def _claim(path: Path, host: str, profile: Profile, now: float) -> str:
         return "error"
 
     payload = {
-        "version": 1,
+        "version": 2,
         "host": host,
         "profile": profile.name,
         "phase": "requested",
+        "request_kind": "initial",
+        "attempts": 1,
+        "title_updates": 0,
+        "requested_at": int(now),
         "claimed_at": int(now),
     }
     try:
@@ -519,25 +551,141 @@ def _claim(path: Path, host: str, profile: Profile, now: float) -> str:
         return "error"
 
 
-def _instruction(language: str) -> str:
+def _read_state(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _write_state(path: Path, state: dict[str, Any]) -> bool:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+        return True
+    except OSError:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def _title_hash(title: str) -> str:
+    return hashlib.sha256(title.strip().encode("utf-8")).hexdigest()[:32]
+
+
+def _state_update(
+    path: Path,
+    state: dict[str, Any],
+    now: float,
+    *,
+    phase: str | None = None,
+    title: str | None = None,
+) -> bool:
+    updated = dict(state)
+    if phase is not None:
+        updated["phase"] = phase
+    if title is not None:
+        updated["title_hash"] = _title_hash(title)
+    updated["updated_at"] = int(now)
+    return _write_state(path, updated)
+
+
+def _request_title_result(
+    profile: Profile,
+    context: PathContext,
+    language: str,
+    *,
+    cwd: Path,
+    mode: str,
+    reason: str,
+    current_title: str | None = None,
+) -> dict[str, Any]:
+    context_data = {
+        "cwd": str(cwd),
+        "relative_path": context.relative_path,
+        "kind_hint": context.kind_hint,
+        "object_hint": context.object_hint,
+        "language": language,
+        "aliases": profile.aliases,
+        "domain_terms": list(profile.domain_terms),
+        "format": "类型 | 对象 | 持续目标",
+        "target_chars": TARGET_TITLE_CHARS,
+        "soft_max_chars": SOFT_MAX_TITLE_CHARS,
+        "hard_max_chars": MAX_TITLE_CHARS,
+        "mode": mode,
+    }
+    if current_title:
+        context_data["current_title"] = current_title
+    return {
+        "version": 1,
+        "action": "request_title",
+        "reason": reason,
+        "profile": {
+            "name": profile.name,
+            "language": profile.language,
+            "source": profile.source,
+        },
+        "context": context_data,
+        "instruction": _instruction(language, mode),
+    }
+
+
+def _instruction(language: str, mode: str = "initial") -> str:
     if language == "zh-CN":
+        if mode == "review":
+            return (
+                "这是一次标题复核。只有用户已经明确切换到新的持续目标，或明确要求改名时，"
+                "才调用宿主原生标题工具；如果主题仍然连续，保持当前标题不变。"
+                "不要覆盖用户自定义标题，不要因为一次短暂的追问改名。"
+                "新标题必须单行，首选三级格式“类型 | 对象 | 持续目标”，缺少稳定类型或对象时降为两级“对象 | 持续目标”。"
+                "“意图·对象 | 任务”仅作为旧宿主兼容格式，三级标题的前两段不得再含“·”。"
+                f"标题目标 {TARGET_TITLE_CHARS} 个字符，超过 {SOFT_MAX_TITLE_CHARS} 个字符会告警，"
+                f"最多 {MAX_TITLE_CHARS} 个字符；保留稳定对象名，不复制长路径、URL、XML 或敏感信息。"
+                "没有必要更新时不要调用标题工具，也不要向用户展示标题建议或解释改名过程。"
+            )
         return (
             "先完成用户首个实质任务，在发送最终答复前才调用宿主原生标题工具改名一次。"
-            "标题必须单行，主推荐格式为“模块名 | 持续目标”；如宿主已有“意图·对象 | 任务”约定，可兼容该格式。"
+            "标题必须单行，首选三级格式“类型 | 对象 | 持续目标”，例如“项目 | 群脉 | 修复重复扫描”；"
+            "缺少稳定类型或对象时降为两级“对象 | 持续目标”。"
+            "“意图·对象 | 任务”仅作为旧宿主兼容格式，三级标题的前两段不得再含“·”。"
             "优先写具体对象、行为、错误现象或决策，不使用“实现”“处理需求”“优化”“问题”等空泛词。"
-            "标题目标约 24 个字符，24 个字符是软上限；保留稳定对象名，不复制长路径、URL、XML 或敏感信息。"
+            f"标题目标 {TARGET_TITLE_CHARS} 个字符，超过 {SOFT_MAX_TITLE_CHARS} 个字符会告警，"
+            f"最多 {MAX_TITLE_CHARS} 个字符；保留稳定对象名，不复制长路径、URL、XML 或敏感信息。"
             "只依据首个实质任务提炼持续目标，不要用关键词模板拼接。后续追问不再改名。"
             "不要向用户展示标题建议或解释改名要求；无原生工具时正常完成，不伪造改名。"
             "如果当前已有用户自定义标题、工具不可用或写入不安全，不要修改标题，也不要声称写入成功。"
         )
+    if mode == "review":
+        return (
+            "This is a title review. Call the host's native title tool only when the user has clearly moved "
+            "to a new ongoing goal or explicitly requested a rename; keep the current title when the topic is continuous. "
+            "Do not overwrite a user-defined title or rename for a single short follow-up. "
+            "Use one line, preferably `kind | object | ongoing goal`; drop to `object | ongoing goal` when there is no "
+            "stable kind or object. Keep `intent·object | task` only as a legacy compatibility form, and never mix `·` "
+            "into a three-part title. "
+            f"Aim for {TARGET_TITLE_CHARS} characters or fewer; exceed {SOFT_MAX_TITLE_CHARS} only with a warning, "
+            f"and never exceed {MAX_TITLE_CHARS}. "
+            "Preserve stable object names and omit long paths, URLs, XML, and secrets. "
+            "Do not call the title tool or show title suggestions when no update is needed."
+        )
     return (
         "Complete the user's first substantive task first; call the host's native session-title tool exactly once, "
         "immediately before sending the final answer. "
-        "Use one line, preferably in the form `module | ongoing goal`; retain `intent·object | task` only as a "
-        "compatibility form when the host already uses it. "
+        "Use one line, preferably `kind | object | ongoing goal`; drop to `object | ongoing goal` when there is no "
+        "stable kind or object. Keep `intent·object | task` only as a legacy compatibility form, and never mix `·` "
+        "into a three-part title. "
         "Prefer concrete objects, actions, observed errors, or decisions; avoid vague words such as implement, "
         "handle requirements, optimize, or issue. "
-        f"Aim for {TARGET_TITLE_CHARS} characters or fewer and treat {SOFT_MAX_TITLE_CHARS} as a soft maximum. "
+        f"Aim for {TARGET_TITLE_CHARS} characters or fewer; exceed {SOFT_MAX_TITLE_CHARS} only with a warning, "
+        f"and never exceed {MAX_TITLE_CHARS}. "
         "Preserve stable repository/object names and omit long paths, URLs, XML, and secrets. "
         "Summarize the ongoing goal from the first substantive task instead of copying a keyword template. "
         "Do not rename the session on later follow-ups. Do not show title suggestions or explain the renaming "
@@ -566,8 +714,6 @@ def prepare(data: dict[str, Any], now: float | None = None) -> dict[str, Any]:
     current_title = data["current_title"]
     if current_title is not None and not isinstance(current_title, str):
         return _skip("title_state_unknown")
-    if isinstance(current_title, str) and current_title.strip():
-        return _skip("manual_title")
 
     try:
         profile = load_profile(cwd)
@@ -582,36 +728,137 @@ def prepare(data: dict[str, Any], now: float | None = None) -> dict[str, Any]:
         return _skip(gate)
 
     claim_time = time.time() if now is None else now
-    claim = _claim(_state_path(host, profile, session_id), host, profile, claim_time)
-    if claim == "exists":
-        return _skip("already_requested")
-    if claim != "claimed":
-        return _skip("state_error")
-
+    state_path = _state_path(host, profile, session_id)
+    state = _read_state(state_path) if state_path.is_file() else {}
     language = _effective_language(profile, prompt)
-    return {
-        "version": 1,
-        "action": "request_title",
-        "reason": "eligible",
-        "profile": {
-            "name": profile.name,
-            "language": profile.language,
-            "source": profile.source,
-        },
-        "context": {
-            "cwd": str(cwd),
-            "relative_path": context.relative_path,
-            "kind_hint": context.kind_hint,
-            "object_hint": context.object_hint,
-            "language": language,
-            "aliases": profile.aliases,
-            "domain_terms": list(profile.domain_terms),
-            "format": "模块名 | 持续目标",
-            "target_chars": TARGET_TITLE_CHARS,
-            "soft_max_chars": SOFT_MAX_TITLE_CHARS,
-        },
-        "instruction": _instruction(language),
-    }
+    normalized_title = current_title.strip() if isinstance(current_title, str) else ""
+
+    if not state:
+        if normalized_title:
+            return _skip("manual_title")
+        claim = _claim(state_path, host, profile, claim_time)
+        if claim == "exists":
+            return _skip("already_requested")
+        if claim != "claimed":
+            return _skip("state_error")
+        return _request_title_result(
+            profile,
+            context,
+            language,
+            cwd=cwd,
+            mode="initial",
+            reason="eligible",
+        )
+
+    phase = state.get("phase")
+    requested_at = state.get("requested_at", state.get("claimed_at", 0))
+    try:
+        requested_at = float(requested_at)
+    except (TypeError, ValueError):
+        requested_at = 0
+
+    if phase == "requested":
+        if normalized_title:
+            if not _state_update(state_path, state, claim_time, phase="applied", title=normalized_title):
+                return _skip("state_error")
+            return _skip("title_applied")
+        attempts = state.get("attempts", 1)
+        try:
+            attempts = int(attempts)
+        except (TypeError, ValueError):
+            attempts = 1
+        if claim_time - requested_at < RETRY_COOLDOWN_SECONDS:
+            return _skip("already_requested" if attempts == 1 else "awaiting_title")
+        if attempts >= MAX_REQUEST_ATTEMPTS:
+            return _skip("awaiting_title")
+        updated = dict(state)
+        updated.update(
+            {
+                "attempts": attempts + 1,
+                "requested_at": int(claim_time),
+                "updated_at": int(claim_time),
+            }
+        )
+        if not _write_state(state_path, updated):
+            return _skip("state_error")
+        return _request_title_result(
+            profile,
+            context,
+            language,
+            cwd=cwd,
+            mode="initial",
+            reason="retry",
+        )
+
+    if phase == "review_requested":
+        previous_hash = state.get("title_hash")
+        if normalized_title and _title_hash(normalized_title) != previous_hash:
+            updated = dict(state)
+            try:
+                title_updates = int(state.get("title_updates", 0))
+            except (TypeError, ValueError):
+                title_updates = 0
+            updated["title_updates"] = title_updates + 1
+            if not _state_update(
+                state_path,
+                updated,
+                claim_time,
+                phase="applied",
+                title=normalized_title,
+            ):
+                return _skip("state_error")
+            return _skip("title_applied")
+        if not _state_update(state_path, state, claim_time, phase="applied"):
+            return _skip("state_error")
+        return _skip("title_unchanged")
+
+    if phase == "applied":
+        if not normalized_title:
+            return _skip("title_cleared")
+        if _title_hash(normalized_title) != state.get("title_hash"):
+            if not _state_update(state_path, state, claim_time, phase="manual"):
+                return _skip("state_error")
+            return _skip("manual_title")
+        title_updates = state.get("title_updates", 0)
+        try:
+            title_updates = int(title_updates)
+        except (TypeError, ValueError):
+            title_updates = 0
+        if not title_update_requested(prompt):
+            return _skip("stable_title")
+        if title_updates >= MAX_TITLE_UPDATES:
+            return _skip("update_limit")
+        last_requested = state.get("updated_at", state.get("claimed_at", 0))
+        try:
+            last_requested = float(last_requested)
+        except (TypeError, ValueError):
+            last_requested = 0
+        if claim_time - last_requested < RETRY_COOLDOWN_SECONDS:
+            return _skip("update_cooldown")
+        updated = dict(state)
+        updated.update(
+            {
+                "phase": "review_requested",
+                "request_kind": "review",
+                "requested_at": int(claim_time),
+                "updated_at": int(claim_time),
+            }
+        )
+        if not _write_state(state_path, updated):
+            return _skip("state_error")
+        return _request_title_result(
+            profile,
+            context,
+            language,
+            cwd=cwd,
+            mode="review",
+            reason="topic_change",
+            current_title=normalized_title,
+        )
+
+    if phase == "manual":
+        return _skip("manual_title")
+    return _skip("state_error")
 
 
 def validate_title(title: Any) -> dict[str, Any]:
@@ -638,19 +885,26 @@ def validate_title(title: Any) -> dict[str, Any]:
     if URL_ONLY.search(normalized):
         result["reason"] = "contains_url"
         return result
-    if normalized.count("|") != 1 or normalized.count(" | ") != 1:
+    separators = normalized.count("|")
+    if separators not in (1, 2) or normalized.count(" | ") != separators:
         result["reason"] = "separator"
         return result
-    left, task = normalized.split(" | ", 1)
-    if not left or not task:
+    segments = normalized.split(" | ")
+    if any(not part.strip() for part in segments):
         result["reason"] = "empty_part"
         return result
-    if left.count("·") > 1:
-        result["reason"] = "left_parts"
-        return result
-    if left.count("·") == 1 and any(not part.strip() for part in left.split("·")):
-        result["reason"] = "left_parts"
-        return result
+    if len(segments) == 3:
+        if any("·" in part for part in segments[:2]):
+            result["reason"] = "left_parts"
+            return result
+    else:
+        left = segments[0]
+        if left.count("·") > 1:
+            result["reason"] = "left_parts"
+            return result
+        if left.count("·") == 1 and any(not part.strip() for part in left.split("·")):
+            result["reason"] = "left_parts"
+            return result
     if CONTINUATION.fullmatch(normalized) or ACTION_ONLY.fullmatch(normalized):
         result["reason"] = "not_a_title"
         return result
@@ -665,10 +919,7 @@ def validate_title(title: Any) -> dict[str, Any]:
 def _format_text(result: dict[str, Any]) -> str:
     if result.get("action") == "request_title":
         context = result.get("context", {})
-        return (
-            f"request_title: {context.get('kind_hint', '')}·{context.get('object_hint', '')}"
-            f" | {context.get('format', '')}"
-        )
+        return f"request_title: {context.get('kind_hint', '')} | {context.get('object_hint', '')}"
     if "valid" in result:
         if result["valid"]:
             return f"valid: {result['title']} ({result['chars']} chars)"

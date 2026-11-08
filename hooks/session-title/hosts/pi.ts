@@ -15,7 +15,7 @@ const TITLE_PARAMS = {
 	properties: {
 		title: {
 			type: "string",
-			description: "One-line session title in the requested module | ongoing goal format.",
+			description: "Set a validated one-line session title in the requested kind | object | ongoing goal format.",
 		},
 	},
 	required: ["title"],
@@ -79,10 +79,15 @@ function taskContext(result: any): string {
 		`Scope kind: ${context.kind_hint ?? ""}`,
 		`Scope object: ${context.object_hint ?? ""}`,
 		`Relative path: ${context.relative_path ?? ""}`,
-		`Format: ${context.format ?? "模块名 | 持续目标"}`,
+		`Format: ${context.format ?? "类型 | 对象 | 持续目标"}`,
 		`Target chars: ${context.target_chars ?? 24}`,
-		`Soft max chars: ${context.soft_max_chars ?? 24}`,
+		`Soft max chars: ${context.soft_max_chars ?? 32}`,
+		`Hard max chars: ${context.hard_max_chars ?? 40}`,
+		`Mode: ${context.mode ?? "initial"}`,
 	];
+	if (context.current_title) {
+		lines.push(`Current title: ${context.current_title}`);
+	}
 	if (terms) {
 		lines.push(`Domain terms: ${terms}`);
 	}
@@ -109,15 +114,19 @@ function textResult(text: string, details: Record<string, unknown>) {
 }
 
 export default function sessionTitleExtension(pi: ExtensionAPI): void {
+	let titleUpdateAllowed = false;
+
 	pi.registerTool({
 		name: TOOL_NAME,
 		label: "Set Session Title",
 		description:
-			"Set the current session display title once, using the validated module | ongoing goal format.",
+			"Set the current session display title using the validated kind | object | ongoing goal format.",
 		promptSnippet: "Set the validated session display title when the session-title task requests it.",
 		parameters: TITLE_PARAMS,
 		defaultActive: false,
 		async execute(_toolCallId, params) {
+			const allowUpdate = titleUpdateAllowed;
+			titleUpdateAllowed = false;
 			const validation = await runCore("validate", { title: params?.title });
 			if (!validation?.valid) {
 				return textResult("Session title rejected; keep the existing title.", {
@@ -127,7 +136,7 @@ export default function sessionTitleExtension(pi: ExtensionAPI): void {
 			}
 
 			try {
-				if (pi.getSessionName()?.trim()) {
+				if (pi.getSessionName()?.trim() && !allowUpdate) {
 					return textResult("Session title unchanged because a user title already exists.", {
 						status: "manual_title",
 					});
@@ -161,9 +170,7 @@ export default function sessionTitleExtension(pi: ExtensionAPI): void {
 		} catch {
 			return;
 		}
-		if (currentTitle?.trim()) {
-			return;
-		}
+		titleUpdateAllowed = false;
 
 		let sessionId: string;
 		try {
@@ -186,6 +193,7 @@ export default function sessionTitleExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
+		titleUpdateAllowed = result.context?.mode === "review";
 		activateTitleTool(pi);
 		return {
 			message: {

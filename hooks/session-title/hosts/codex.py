@@ -192,10 +192,14 @@ def _additional_context(result: dict[str, Any]) -> str:
         f"Scope kind: {context.get('kind_hint', '')}",
         f"Scope object: {context.get('object_hint', '')}",
         f"Relative path: {context.get('relative_path', '')}",
-        f"Format: {context.get('format', '模块名 | 持续目标')}",
+        f"Format: {context.get('format', '类型 | 对象 | 持续目标')}",
         f"Target chars: {context.get('target_chars', 24)}",
-        f"Soft max chars: {context.get('soft_max_chars', 24)}",
+        f"Soft max chars: {context.get('soft_max_chars', 32)}",
+        f"Hard max chars: {context.get('hard_max_chars', 40)}",
+        f"Mode: {context.get('mode', 'initial')}",
     ]
+    if context.get("current_title"):
+        lines.append(f"Current title: {context['current_title']}")
     if terms:
         lines.append(f"Domain terms: {terms}")
     lines.extend((str(result.get("instruction", "")), "</session-title-task>"))
@@ -219,7 +223,8 @@ def main() -> int:
             return 0
         cwd = Path(cwd_value).expanduser().resolve(strict=False)
 
-        if session_title.request_status("codex", cwd, session_id) != "absent":
+        status = session_title.request_status("codex", cwd, session_id)
+        if not session_title.needs_probe(status, prompt):
             return 0
         probe = _read_thread_title(session_id, cwd)
         if not probe.known:

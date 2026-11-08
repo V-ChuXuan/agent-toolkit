@@ -27,10 +27,16 @@ python -B -X utf8 hooks/session-title/session_title.py validate --title "Example
 ## 行为约定
 
 - 先完成首个实质任务，在发送最终答复前请求宿主原生标题工具改名一次。
-- 推荐格式为 `模块名 | 持续目标`，目标 24 个 Unicode 字符，软上限 24，硬上限 80。
+- 自动标题只在用户明确切换主题或要求改名时复核，不按每轮追问改名。
+- 自动标题最多复核更新 2 次；用户改过标题后进入人工锁定状态。
+- 首次改名请求未被宿主执行时，短暂冷却后最多重试 3 次。
+- 首选格式为 `类型 | 对象 | 持续目标`；缺少稳定类型或对象时降为 `对象 | 持续目标`。
+- `意图·对象 | 任务` 仅作为旧宿主兼容格式，三级标题的前两段不得含 `·`。
+- 目标 24 个 Unicode 字符，超过 32 个字符附 warning，硬上限 40 个字符。
+- 目录推导出的对象名超过 24 个字符时压缩为 24 个字符以内并以 `…` 结尾。
 - 优先写具体对象、行为、错误现象或决策，避免空泛标题。
 - 人工标题、未知标题、工具不可用、状态写入失败时静默跳过。
-- 首个有效请求 claim 后，同一 host/profile/session 不再请求；请求并不证明改名成功。
+- state 区分 `requested`、`review_requested`、`applied` 和 `manual`；请求不等于改名成功，下一次探测会回读标题并确认状态。
 - 不向用户展示标题建议或解释改名过程。
 
 ## 目录与入口
@@ -42,9 +48,13 @@ session-title/
   hosts/codex.py         # Codex command-hook 适配器
   hosts/pi.ts            # Pi 扩展适配器
   test_*.py              # 标准库单测
+  INSTALL.md             # 给 Agent 执行的安装、验证与卸载步骤
 ```
 
 接入时保留完整目录。`hosts/codex.py` 供薄入口导入，直接启动请使用 `codex_hook.py`。
+
+由 Agent 执行安装时，直接按 [INSTALL.md](INSTALL.md) 操作；本 README 描述契约，
+不重复安装步骤。
 
 ## Profile
 
@@ -88,11 +98,11 @@ session-title/
 }
 ```
 
-`cwd` 由宿主传入实际工作目录。`current_title` 必须由适配器明确提供：缺失或不是字符串/null 表示未知并跳过；`null` 或空字符串表示已确认无标题；非空字符串表示已有标题，跳过且不占 state。
+`cwd` 由宿主传入实际工作目录。`current_title` 必须由适配器明确提供：缺失或不是字符串/null 表示未知并跳过；`null` 或空字符串表示已确认无标题；非空字符串表示已有标题，除非 state 已确认它是自动标题且当前请求触发复核，否则保持人工标题保护。
 
-`prepare` 返回 `action=request_title` 或 `action=skip` 与 reason。JSON 中的 context 可包含完整 cwd 和 profile aliases，用于本地适配；不会保存原始 prompt。Codex 注入的消息仅保留目录提示、相对路径、领域词和命名要求，不包含原始 prompt、session id 或核心生成的最终标题。
+`prepare` 返回 `action=request_title` 或 `action=skip` 与 reason。首次命名使用 `mode=initial`；主题复核使用 `mode=review` 并携带当前自动标题。JSON 中的 context 可包含完整 cwd 和 profile aliases，用于本地适配；不会保存原始 prompt。Codex 注入的消息仅保留目录提示、相对路径、领域词、当前标题和命名要求，不包含原始 prompt、session id 或核心生成的最终标题。
 
-`validate` 从 `--title` 或标准输入的 `title` 字段读取标题，返回 valid、reason、title、chars；超过软上限时附 warning。CLI 的 `--format json|text` 放在子命令前。进程退出码为 0，调用方需检查 action/valid，不能仅据退出码判断命名成功。
+`validate` 从 `--title` 或标准输入的 `title` 字段读取标题，返回 valid、reason、title、chars；超过软上限时附 warning。它接受三级、二级和旧兼容两级格式，拒绝空段、错误分隔符数量、三级混入 `·` 和超过硬上限的标题。CLI 的 `--format json|text` 放在子命令前。进程退出码为 0，调用方需检查 action/valid，不能仅据退出码判断命名成功。
 
 ## 宿主接入
 
@@ -108,7 +118,7 @@ $command
 
 将得到的命令手动加入宿主 `UserPromptSubmit` 的 command Hook，timeout 建议 15 秒。不要覆盖已有 Hook 列表。宿主的注册、信任和启用要求需按实际版本确认。
 
-适配器通过 `codex app-server --stdio` 的 `thread/read` 探测标题；可用 `CODEX_EXECUTABLE` 指定可执行文件。它只请求命名并注入上下文，不直接写标题。真实自动改名还要求宿主向当前模型暴露安全的原生标题工具；工具不存在时保持跳过。
+适配器通过 `codex app-server --stdio` 的 `thread/read` 探测标题；可用 `CODEX_EXECUTABLE` 指定可执行文件。它只请求命名并注入上下文，不直接写标题。常规追问不会触发 app-server 探测；明确主题切换时才复核自动标题。真实自动改名还要求宿主向当前模型暴露安全的原生标题工具；工具不存在时保持跳过。
 
 ### Pi
 
@@ -125,7 +135,7 @@ OMP 18.0.4 的历史有界试验停在模型请求超时，未达到支持门槛
 ## 状态与隐私
 
 - `SESSION_TITLE_STATE_ROOT` 可指定 state 根。默认使用 `LOCALAPPDATA` 下的 `session-title/state`；变量不可用时回退到用户目录下 `AppData/Local/session-title/state`。
-- 分区为 host/profile/session-id 哈希；state 文件只含版本、host、profile、阶段和时间，不保存 prompt、完整 cwd、标题或凭据。
+- 分区为 host/profile/session-id 哈希；state 文件只含版本、host、profile、阶段、标题指纹、尝试次数和时间，不保存 prompt、完整 cwd、标题内容或凭据。
 - 成功 claim 使用 `O_EXCL`，并发只有一个请求；调用时按 30 天 TTL 清理过期 state。
 - 核心不读取 transcript、rollout、数据库或历史消息，不直接写宿主私有存储；Codex 适配器通过公开 app-server API 读取标题。
 
